@@ -1,4 +1,8 @@
 import { webcrypto } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 
 // ─── Constants ──────────────────────────────────────────────────────────────────
 
@@ -14,6 +18,62 @@ const REQUIRED_BETAS = [
   "oauth-2025-04-20",
   "interleaved-thinking-2025-05-14",
 ];
+
+function readClaudeCliOauth() {
+  try {
+    const raw = readFileSync(join(homedir(), ".claude", ".credentials.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    const oauth = parsed?.claudeAiOauth;
+    if (!oauth?.accessToken || !oauth?.refreshToken || !oauth?.expiresAt) {
+      return null;
+    }
+    return {
+      type: "oauth",
+      access: oauth.accessToken,
+      refresh: oauth.refreshToken,
+      expires: oauth.expiresAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function syncFromClaudeCli(client, currentAuth, requireValid = false) {
+  let cliAuth = readClaudeCliOauth();
+
+  if (
+    requireValid &&
+    (!cliAuth?.access || !cliAuth?.expires || cliAuth.expires <= Date.now())
+  ) {
+    spawnSync("claude", ["-p", "Reply with exactly OK."], {
+      stdio: "ignore",
+      windowsHide: true,
+      timeout: 120000,
+    });
+    cliAuth = readClaudeCliOauth();
+  }
+
+  if (!cliAuth?.access || !cliAuth?.refresh || !cliAuth?.expires) {
+    return currentAuth;
+  }
+
+  const shouldSync =
+    !currentAuth?.access ||
+    !currentAuth?.expires ||
+    cliAuth.expires > currentAuth.expires ||
+    (requireValid && cliAuth.expires > Date.now());
+
+  if (!shouldSync) {
+    return currentAuth;
+  }
+
+  await client.auth.set({
+    path: { id: "anthropic" },
+    body: cliAuth,
+  });
+
+  return cliAuth;
+}
 
 // ─── PKCE helpers (no external dependency) ──────────────────────────────────────
 
@@ -240,6 +300,11 @@ async function refreshToken(currentAuth, client) {
   if (_refreshPromise) return _refreshPromise;
 
   _refreshPromise = (async () => {
+    currentAuth = await syncFromClaudeCli(client, currentAuth, true);
+    if (currentAuth?.access && currentAuth?.expires > Date.now()) {
+      return currentAuth.access;
+    }
+
     const MAX_RETRIES = 5;
     // Start at 5s, then 15s, 30s, 60s, 120s — avoids hammering the endpoint
     const BACKOFF_MS = [5000, 15000, 30000, 60000, 120000];
@@ -256,6 +321,11 @@ async function refreshToken(currentAuth, client) {
       });
 
       if (response.status === 429) {
+        currentAuth = await syncFromClaudeCli(client, currentAuth, true);
+        if (currentAuth?.access && currentAuth?.expires > Date.now()) {
+          return currentAuth.access;
+        }
+
         const retryAfter = response.headers.get("retry-after");
         const waitMs = retryAfter
           ? parseInt(retryAfter, 10) * 1000
@@ -305,7 +375,7 @@ async function refreshToken(currentAuth, client) {
 /**
  * @type {import('@opencode-ai/plugin').Plugin}
  */
-export async function AnthropicAuthPlugin({ client }) {
+export const AnthropicAuthPlugin = async ({ client } = {}) => {
   return {
     // ── System prompt transform ───────────────────────────────────────────
     "experimental.chat.system.transform": (_input, output) => {
@@ -328,19 +398,10 @@ export async function AnthropicAuthPlugin({ client }) {
        * Called by OpenCode to get provider options (apiKey, custom fetch, etc.)
        * whenever the Anthropic provider is used.
        */
-      async loader(getAuth, provider) {
+      async loader(getAuth) {
         const auth = await getAuth();
 
         if (auth.type === "oauth") {
-          // Zero out cost display for subscription users
-          for (const model of Object.values(provider.models)) {
-            model.cost = {
-              input: 0,
-              output: 0,
-              cache: { read: 0, write: 0 },
-            };
-          }
-
           return {
             // Must be empty string — the SDK validates apiKey is present,
             // but we use Bearer auth instead via custom fetch.
@@ -358,6 +419,7 @@ export async function AnthropicAuthPlugin({ client }) {
               // ── 1. Get fresh auth (may need token refresh) ──────────
               let currentAuth = await getAuth();
               if (currentAuth.type !== "oauth") return fetch(input, init);
+              currentAuth = await syncFromClaudeCli(client, currentAuth);
 
               // Refresh 5 minutes before expiry to avoid race conditions
               const REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -365,10 +427,7 @@ export async function AnthropicAuthPlugin({ client }) {
                 !currentAuth.access ||
                 currentAuth.expires < Date.now() + REFRESH_BUFFER_MS
               ) {
-                currentAuth.access = await refreshToken(
-                  currentAuth,
-                  client,
-                );
+                  currentAuth.access = await refreshToken(currentAuth, client);
               }
 
               // ── 2. Build headers ───────────────────────────────────
@@ -532,4 +591,6 @@ export async function AnthropicAuthPlugin({ client }) {
       ],
     },
   };
-}
+};
+
+export default AnthropicAuthPlugin;
